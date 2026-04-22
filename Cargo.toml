@@ -1,8 +1,12 @@
 [package]
 name = "a9-cli"
-version = "0.1.0"
+version = "0.1.0-rc"
 edition = "2024"
-
+description = "CLI for installing and managing a9 tools from ars-vivendi"
+authors = ["ars-vivendi"]
+license = "MIT"
+repository = "https://github.com/ars-vivendi/a9-cli"
+publish = true
 [[bin]]
 name = "a9"
 path = "src/main.rs"
