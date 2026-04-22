@@ -11,6 +11,11 @@ struct GhRelease {
 }
 
 #[derive(Deserialize)]
+struct GhTag {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct Crates2 {
     installs: HashMap<String, serde_json::Value>,
 }
@@ -92,16 +97,36 @@ fn authed_url(repo: &str, token: &str) -> String {
 }
 
 fn latest_tag(repo: &str, token: &str) -> Result<String, String> {
-    let url = format!("https://api.github.com/repos/{ORG}/{repo}/releases/latest");
+    let releases_url = format!("https://api.github.com/repos/{ORG}/{repo}/releases/latest");
+    let resp = ureq::get(&releases_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("User-Agent", "a9-cli")
+        .call();
 
-    ureq::get(&url)
+    match resp {
+        Ok(r) => {
+            return r
+                .into_json::<GhRelease>()
+                .map(|r| r.tag_name)
+                .map_err(|e| format!("failed to parse GitHub response: {e}"));
+        }
+        Err(ureq::Error::Status(404, _)) => {}
+        Err(e) => return Err(format!("GitHub API error: {e}")),
+    }
+
+    let tags_url = format!("https://api.github.com/repos/{ORG}/{repo}/tags");
+    let tags: Vec<GhTag> = ureq::get(&tags_url)
         .set("Authorization", &format!("Bearer {token}"))
         .set("User-Agent", "a9-cli")
         .call()
-        .map_err(|e| format!("GitHub API error: {e}"))?
-        .into_json::<GhRelease>()
-        .map(|r| r.tag_name)
-        .map_err(|e| format!("failed to parse GitHub response: {e}"))
+        .map_err(|e| format!("GitHub tags API error: {e}"))?
+        .into_json()
+        .map_err(|e| format!("failed to parse tags response: {e}"))?;
+
+    tags.into_iter()
+        .next()
+        .map(|t| t.name)
+        .ok_or_else(|| format!("no tags found for {repo}"))
 }
 
 fn cargo_install(repo: &str, tag: &str, force: bool, locked: bool, token: &str) -> bool {
