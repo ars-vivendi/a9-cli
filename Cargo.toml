@@ -7,6 +7,7 @@ authors = ["ars-vivendi"]
 license = "MIT"
 repository = "https://github.com/ars-vivendi/a9-cli"
 publish = true
+
 [[bin]]
 name = "a9"
 path = "src/main.rs"
