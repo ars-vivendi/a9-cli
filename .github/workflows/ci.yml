@@ -35,4 +35,5 @@ jobs:
           A9_GITHUB_TOKEN: ${{ secrets.A9_GITHUB_TOKEN }}
         run: |
           cargo binstall a9-lint --no-confirm --only-signed || cargo install --git https://x-access-token:${A9_GITHUB_TOKEN}@github.com/ars-vivendi/a9-lint.git --branch main
+          git config core.hooksPath .githooks
           cargo a9-lint --check
