@@ -19,34 +19,42 @@ struct Crates2 {
 /// Arguments for the install subcommand
 #[derive(Parser)]
 struct InstallArgs {
-    /// Tool name, optionally with semver requirement: `lint`, `a9-lint`, `lint@0.1.23`, `lint@^0.1`
-    tool: String,
-    /// Semver requirement; overrides @version in tool name (e.g. `^0.1`, `>=0.1.20`, `0.1.23`)
+    /// Tool name(s), optionally with semver requirement: `lint`, `lint@0.1.23`, `lint@^0.1`
+    #[arg(required = true)]
+    tools: Vec<String>,
+    /// Semver requirement applied to all tools (e.g. `^0.1`, `>=0.1.20`, `0.1.23`)
     #[arg(long, value_name = "REQ")]
     version: Option<String>,
     /// Force reinstall even if already up to date
-    #[arg(long)]
+    #[arg(long, short = 'f')]
     force: bool,
     /// Use Cargo.lock from the repository
     #[arg(long)]
     locked: bool,
+    /// Do not print cargo output
+    #[arg(long, short = 'q')]
+    quiet: bool,
 }
 
 /// Arguments for the uninstall subcommand
 #[derive(Parser)]
 struct UninstallArgs {
-    /// Tool short name (e.g. `lint` or `a9-lint`)
-    tool: String,
+    /// Tool name(s) to uninstall (e.g. `lint`, `a9-lint`)
+    #[arg(required = true)]
+    tools: Vec<String>,
 }
 
 /// Arguments for the update subcommand
 #[derive(Parser)]
 struct UpdateArgs {
-    /// Tool short name; omit to update all installed a9-* tools
-    tool: Option<String>,
+    /// Tool name(s) to update; omit to update all installed a9-* tools
+    tools: Vec<String>,
     /// Use Cargo.lock from the repository
     #[arg(long)]
     locked: bool,
+    /// Do not print cargo output
+    #[arg(long, short = 'q')]
+    quiet: bool,
 }
 
 #[derive(Parser)]
@@ -134,7 +142,14 @@ fn resolve_tag(repo: &str, token: &str, req: Option<&str>) -> Result<String, Str
         .ok_or_else(|| format!("no tag matching '{req_str}' found for {repo}"))
 }
 
-fn cargo_install(repo: &str, tag: &str, force: bool, locked: bool, token: &str) -> bool {
+fn cargo_install(
+    repo: &str,
+    tag: &str,
+    force: bool,
+    locked: bool,
+    quiet: bool,
+    token: &str,
+) -> bool {
     let url = authed_url(repo, token);
 
     let mut args = vec!["install", "--git", url.as_str(), "--tag", tag];
@@ -145,6 +160,10 @@ fn cargo_install(repo: &str, tag: &str, force: bool, locked: bool, token: &str) 
 
     if locked {
         args.push("--locked");
+    }
+
+    if quiet {
+        args.push("--quiet");
     }
 
     process::Command::new("cargo")
@@ -190,53 +209,23 @@ fn installed_a9_tools() -> Vec<(String, String)> {
 
 fn handle_install(args: &InstallArgs) -> Result<String, String> {
     let token = get_token()?;
-    let (tool_name, inline_req) = args
-        .tool
-        .split_once('@')
-        .map_or((args.tool.as_str(), None), |(n, r)| (n, Some(r)));
-    let repo = crate_name(tool_name);
-    let req = args.version.as_deref().or(inline_req);
-    let tag = resolve_tag(&repo, &token, req)?;
 
-    if cargo_install(&repo, &tag, args.force, args.locked, &token) {
-        Ok(format!("{repo} {tag} installed"))
-    } else {
-        Err(format!("cargo install {repo} failed"))
-    }
-}
-
-fn handle_uninstall(args: &UninstallArgs) -> Result<String, String> {
-    let repo = crate_name(&args.tool);
-
-    if cargo_uninstall(&repo) {
-        Ok(format!("{repo} uninstalled"))
-    } else {
-        Err(format!("cargo uninstall {repo} failed"))
-    }
-}
-
-fn handle_update(args: &UpdateArgs) -> Result<String, String> {
-    let token = get_token()?;
-
-    let repos: Vec<String> = if let Some(t) = &args.tool {
-        vec![crate_name(t)]
-    } else {
-        let installed = installed_a9_tools();
-
-        if installed.is_empty() {
-            return Ok("no a9 tools installed".to_string());
-        }
-
-        installed.into_iter().map(|(name, _)| name).collect()
-    };
-
+    let mut installed = vec![];
     let mut failures = vec![];
 
-    for repo in &repos {
-        match resolve_tag(repo, &token, None) {
+    for entry in &args.tools {
+        let (tool_name, inline_req) = entry
+            .split_once('@')
+            .map_or((entry.as_str(), None), |(n, r)| (n, Some(r)));
+        let repo = crate_name(tool_name);
+        let req = args.version.as_deref().or(inline_req);
+
+        match resolve_tag(&repo, &token, req) {
             Err(e) => failures.push(format!("{repo}: {e}")),
             Ok(tag) => {
-                if !cargo_install(repo, &tag, false, args.locked, &token) {
+                if cargo_install(&repo, &tag, args.force, args.locked, args.quiet, &token) {
+                    installed.push(format!("{repo} {tag}"));
+                } else {
                     failures.push(format!("{repo}: cargo install failed"));
                 }
             }
@@ -244,9 +233,86 @@ fn handle_update(args: &UpdateArgs) -> Result<String, String> {
     }
 
     if failures.is_empty() {
-        Ok(format!("updated {} tool(s)", repos.len()))
-    } else {
+        Ok(format!("installed: {}", installed.join(", ")))
+    } else if installed.is_empty() {
         Err(failures.join("; "))
+    } else {
+        Err(format!(
+            "installed: {}; failed: {}",
+            installed.join(", "),
+            failures.join("; ")
+        ))
+    }
+}
+
+fn handle_uninstall(args: &UninstallArgs) -> Result<String, String> {
+    let mut uninstalled = vec![];
+    let mut failures = vec![];
+
+    for entry in &args.tools {
+        let repo = crate_name(entry);
+
+        if cargo_uninstall(&repo) {
+            uninstalled.push(repo);
+        } else {
+            failures.push(format!("{repo}: cargo uninstall failed"));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(format!("uninstalled: {}", uninstalled.join(", ")))
+    } else if uninstalled.is_empty() {
+        Err(failures.join("; "))
+    } else {
+        Err(format!(
+            "uninstalled: {}; failed: {}",
+            uninstalled.join(", "),
+            failures.join("; ")
+        ))
+    }
+}
+
+fn handle_update(args: &UpdateArgs) -> Result<String, String> {
+    let token = get_token()?;
+
+    let repos: Vec<String> = if args.tools.is_empty() {
+        let installed = installed_a9_tools();
+
+        if installed.is_empty() {
+            return Ok("no a9 tools installed".to_string());
+        }
+
+        installed.into_iter().map(|(name, _)| name).collect()
+    } else {
+        args.tools.iter().map(|t| crate_name(t)).collect()
+    };
+
+    let mut updated = vec![];
+    let mut failures = vec![];
+
+    for repo in &repos {
+        match resolve_tag(repo, &token, None) {
+            Err(e) => failures.push(format!("{repo}: {e}")),
+            Ok(tag) => {
+                if cargo_install(repo, &tag, false, args.locked, args.quiet, &token) {
+                    updated.push(format!("{repo} {tag}"));
+                } else {
+                    failures.push(format!("{repo}: cargo install failed"));
+                }
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(format!("updated: {}", updated.join(", ")))
+    } else if updated.is_empty() {
+        Err(failures.join("; "))
+    } else {
+        Err(format!(
+            "updated: {}; failed: {}",
+            updated.join(", "),
+            failures.join("; ")
+        ))
     }
 }
 
