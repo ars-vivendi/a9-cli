@@ -1,14 +1,10 @@
 use std::{collections::HashMap, env, fs, path::PathBuf, process};
 
 use clap::Parser;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 const ORG: &str = "ars-vivendi";
-
-#[derive(Deserialize)]
-struct GhRelease {
-    tag_name: String,
-}
 
 #[derive(Deserialize)]
 struct GhTag {
@@ -23,11 +19,11 @@ struct Crates2 {
 /// Arguments for the install subcommand
 #[derive(Parser)]
 struct InstallArgs {
-    /// Tool short name (e.g. `lint` or `a9-lint` installs a9-lint from ars-vivendi)
+    /// Tool name, optionally with semver requirement: `lint`, `a9-lint`, `lint@0.1.23`, `lint@^0.1`
     tool: String,
-    /// Tag to install; defaults to latest release
-    #[arg(long)]
-    tag: Option<String>,
+    /// Semver requirement; overrides @version in tool name (e.g. `^0.1`, `>=0.1.20`, `0.1.23`)
+    #[arg(long, value_name = "REQ")]
+    version: Option<String>,
     /// Force reinstall even if already up to date
     #[arg(long)]
     force: bool,
@@ -96,26 +92,9 @@ fn authed_url(repo: &str, token: &str) -> String {
     format!("https://x-access-token:{token}@github.com/{ORG}/{repo}")
 }
 
-fn latest_tag(repo: &str, token: &str) -> Result<String, String> {
-    let releases_url = format!("https://api.github.com/repos/{ORG}/{repo}/releases/latest");
-    let resp = ureq::get(&releases_url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("User-Agent", "a9-cli")
-        .call();
-
-    match resp {
-        Ok(r) => {
-            return r
-                .into_json::<GhRelease>()
-                .map(|r| r.tag_name)
-                .map_err(|e| format!("failed to parse GitHub response: {e}"));
-        }
-        Err(ureq::Error::Status(404, _)) => {}
-        Err(e) => return Err(format!("GitHub API error: {e}")),
-    }
-
-    let tags_url = format!("https://api.github.com/repos/{ORG}/{repo}/tags");
-    let tags: Vec<GhTag> = ureq::get(&tags_url)
+fn fetch_tags(repo: &str, token: &str) -> Result<Vec<String>, String> {
+    let url = format!("https://api.github.com/repos/{ORG}/{repo}/tags?per_page=100");
+    let tags: Vec<GhTag> = ureq::get(&url)
         .set("Authorization", &format!("Bearer {token}"))
         .set("User-Agent", "a9-cli")
         .call()
@@ -123,10 +102,36 @@ fn latest_tag(repo: &str, token: &str) -> Result<String, String> {
         .into_json()
         .map_err(|e| format!("failed to parse tags response: {e}"))?;
 
-    tags.into_iter()
-        .next()
-        .map(|t| t.name)
-        .ok_or_else(|| format!("no tags found for {repo}"))
+    Ok(tags.into_iter().map(|t| t.name).collect())
+}
+
+fn resolve_tag(repo: &str, token: &str, req: Option<&str>) -> Result<String, String> {
+    let tags = fetch_tags(repo, token)?;
+
+    if tags.is_empty() {
+        return Err(format!("no tags found for {repo}"));
+    }
+
+    let Some(req_str) = req else {
+        return Ok(tags.into_iter().next().unwrap());
+    };
+
+    let vreq = VersionReq::parse(req_str)
+        .map_err(|e| format!("invalid version requirement '{req_str}': {e}"))?;
+
+    let mut candidates: Vec<Version> = tags
+        .iter()
+        .filter_map(|t| Version::parse(t.trim_start_matches('v')).ok())
+        .filter(|v| vreq.matches(v))
+        .collect();
+
+    candidates.sort();
+
+    candidates
+        .into_iter()
+        .next_back()
+        .map(|v| format!("v{v}"))
+        .ok_or_else(|| format!("no tag matching '{req_str}' found for {repo}"))
 }
 
 fn cargo_install(repo: &str, tag: &str, force: bool, locked: bool, token: &str) -> bool {
@@ -185,12 +190,13 @@ fn installed_a9_tools() -> Vec<(String, String)> {
 
 fn handle_install(args: &InstallArgs) -> Result<String, String> {
     let token = get_token()?;
-    let repo = crate_name(&args.tool);
-
-    let tag = match &args.tag {
-        Some(t) => t.clone(),
-        None => latest_tag(&repo, &token)?,
-    };
+    let (tool_name, inline_req) = args
+        .tool
+        .split_once('@')
+        .map_or((args.tool.as_str(), None), |(n, r)| (n, Some(r)));
+    let repo = crate_name(tool_name);
+    let req = args.version.as_deref().or(inline_req);
+    let tag = resolve_tag(&repo, &token, req)?;
 
     if cargo_install(&repo, &tag, args.force, args.locked, &token) {
         Ok(format!("{repo} {tag} installed"))
@@ -227,7 +233,7 @@ fn handle_update(args: &UpdateArgs) -> Result<String, String> {
     let mut failures = vec![];
 
     for repo in &repos {
-        match latest_tag(repo, &token) {
+        match resolve_tag(repo, &token, None) {
             Err(e) => failures.push(format!("{repo}: {e}")),
             Ok(tag) => {
                 if !cargo_install(repo, &tag, false, args.locked, &token) {
